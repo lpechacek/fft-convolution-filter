@@ -32,7 +32,6 @@ from qgis.core import *
 import qgis.utils
 from qgis.gui import *
 import rasterio
-from rasterio.warp import calculate_default_transform, reproject, Resampling
 import numpy as np
 from scipy.signal import fftconvolve
 import math
@@ -204,18 +203,12 @@ class FFTConvolution:
         result = self.dlg.exec_()
         # See if OK was pressed
         if result:
-            if self.dlg.smoothing.isChecked():
-                edge = False
-            else:
-                edge = True
             #call the function linking to real work
             #the input is translated from the GUI input to correct format here
             self.fft_convolution(
                 in_layer=self.dlg.input_layer.currentLayer(),
                 out_path=self.dlg.output_file.text(),
                 size=self.dlg.size.text(),
-                edge=edge,
-                new_crs=self.dlg.crs.crs(),
                 tiled=self.dlg.window.isChecked(),
                 tilerows=self.dlg.window_rows.text(),
                 tilecols=self.dlg.window_cols.text(),
@@ -223,8 +216,8 @@ class FFTConvolution:
             )
 
     #this function parses the arguments, calls the appropriate functions and displays the new layer if needed
-    def fft_convolution( self, in_layer, out_path, size=10, edge=False, new_crs=None, 
-                         tiled=False, tilerows=0, tilecols=0, add_layer=True ):
+    def fft_convolution(self, in_layer, out_path, size=10, tiled=False,
+                        tilerows=0, tilecols=0, add_layer=True):
         #if the file has no extension, add '.tif'
         ext = os.path.splitext(out_path)[-1].lower()
         if ext == '':
@@ -237,11 +230,6 @@ class FFTConvolution:
             )
             if reply == QMessageBox.No:
                 return False
-        #we need the CRS as EPSG code, or None if invalid
-        if new_crs.isValid():
-            new_crs = new_crs.authid()
-        else:
-            new_crs = None
         #preprocessing the input layer's path
         in_path = in_layer.dataProvider().dataSourceUri()
         #QMessageBox.information(None, "DEBUG:", str(in_path))
@@ -253,11 +241,9 @@ class FFTConvolution:
             in_path = in_path,
             out_path=out_path,
             size = int(re.sub(r"\D", "", size)),
-            edge=edge, 
             tiled = tiled,
             tilerows = tilerows,
             tilecols = tilecols, 
-            new_crs = new_crs
         )
         if add_layer:
             QgsProject.instance().addMapLayer(layer)
@@ -303,28 +289,9 @@ class FFTConvolution:
                 cell = ((i,j),((i*tilerows,i*tilerows+rowsize),(j*tilecols,j*tilecols+colsize)))
                 yield cell
 
-    #like __generate_windows(), but returns an array
-    def __generate_window_array(self, height, width, tilerows, tilecols):
-        rownum = int(math.ceil(float(height)/tilerows))
-        colnum = int(math.ceil(float(width)/tilecols))
-        windows = np.asarray(np.zeros((height, width),dtype=object))
-        for i in range(rownum):
-            #last row's and column's dimensions are computed by modulo - they are smaller than regular tiles
-            if i == rownum-1:
-                rowsize = height%tilerows
-            else:
-                rowsize = tilerows
-            for j in range(colnum):
-                if j == colnum-1:
-                    colsize = width%tilecols
-                else:
-                    colsize = tilecols
-                windows[i][j]=((i*tilerows,i*tilerows+rowsize),(j*tilecols,j*tilecols+colsize))
-        return windows
-
     #processes the window parameters
     #returns the windows as a generator or an array (specified in the generator parameter)
-    def __compute_windows(self, in_raster, height, width, size, tilerows=0, tilecols=0, generator=True):
+    def __compute_windows(self, in_raster, height, width, size, tilerows=0, tilecols=0):
         #input validation
         size = int(size)
         try:
@@ -335,17 +302,7 @@ class FFTConvolution:
             tilecols = int(tilecols)
         except ValueError:
             tilecols = 0
-        #when raster's dimensions are modified due to reprojection, we must adjust the windows as well
-        #this algorithm is quick'n'dirty - we just sompute one ratio and make all tiles larger/smaller
-        #reprojecting each tile node would be better - perhaps in some future version
-        if height != in_raster.height or width != in_raster.width:
-            hratio = float(height)/in_raster.height
-            wratio = float(width)/in_raster.width
-        else:
-            hratio = 1
-            wratio = 1
-        
-        windows = []
+
         #if only one of tile's dimension was set, we assume a square
         if tilecols == 0 and tilerows > 0:
             tilecols = tilerows
@@ -360,61 +317,19 @@ class FFTConvolution:
             blocks = in_raster.block_shapes
             block = blocks[0]
             if min(block[0],block[1]) > 2*size:
-                #if we compute the original raster, use the block as-is
-                #otherwise use the dimensions and continue
-                if hratio==1 and wratio==1:
-                    return in_raster.block_windows(1)
-                else:
-                    tilerows = block[0]
-                    tilecols = block[1]
+                return in_raster.block_windows(1)
             else:
                 #"2*size + 100" is an arbitrary constant
                 #it's quite efficient on smaller rasters and shouldn't make any memory issues
                 #really small rasters shouldn't be computed by tiles anyway
                 tilerows = 2*size + 100
                 tilecols = 2*size + 100
-        #we transform the dimensions if needed
-        tilerows = int(hratio * tilerows)
-        tilecols = int(wratio * tilecols)
         #if the tiles are too big (more than half of any dimension of the raster),
         #we switch to the untiled algorithm
         if 2*tilerows >= height or 2*tilecols >= width:
             return False
-        #if windows are not read from the raster, we must make them
-        if generator:
-            windows = self.__generate_windows(height, width, tilerows, tilecols)
-        else:
-            windows = self.__generate_window_array(height, width, tilerows, tilecols)
-        return windows
 
-    #computes the affine transformation, raster dimensions and metadata for the new raster
-    def __compute_transform(self, in_raster, new_crs):
-        affine, width, height = calculate_default_transform(
-            in_raster.crs, new_crs, in_raster.width, in_raster.height, *in_raster.bounds
-        )
-        kwargs = in_raster.meta.copy()
-        kwargs.update({
-            'driver':'GTiff',
-            'crs': new_crs,
-            'transform': affine,
-            'affine': affine,
-            'width': width,
-            'height': height
-        })
-        return affine, height, width, kwargs
-
-    #calls reproject() function for every band
-    def __reproject(self, in_raster, out_raster, affine, new_crs):
-        for k in range(1, in_raster.count + 1):
-            reproject(
-                source=rasterio.band(in_raster, k),
-                destination=rasterio.band(out_raster, k),
-                src_transform=affine,
-                src_crs=in_raster.crs,
-                dst_transform=affine,
-                dst_crs=new_crs,
-                resampling=Resampling.nearest)
-        return out_raster
+        return self.__generate_windows(height, width, tilerows, tilecols)
 
     #the original MikeT's function from http://gis.stackexchange.com/a/10467
     #my addition is the conversion of the padded array to float to avoid errors with integer rasters
@@ -459,16 +374,14 @@ class FFTConvolution:
 
     #the real work is done here
     #filters a raster specified by the file's path (in_path) and writes it to another file (out_path)
-    def gaussian_filter(self, in_path, out_path, size, edge=False, tiled=False, tilerows=0, tilecols=0, new_crs=None):
+    def gaussian_filter(self, in_path, out_path, size, tiled=False, tilerows=0, tilecols=0):
         with rasterio.Env():
             with rasterio.open(in_path,'r') as in_raster:
-                if new_crs == None:
-                    new_crs = in_raster.crs
-                affine, height, width, kwargs = self.__compute_transform(in_raster, new_crs)
+                processing_windows = [[0, [(0, in_raster.height), (0, in_raster.width)]]]
                 if tiled:
                     #we make two sets of tiles, for the old and the new raster
                     #this is important in case of reprojection
-                    old_windows = self.__compute_windows(
+                    new_processing_windows = self.__compute_windows(
                         in_raster=in_raster,
                         height=in_raster.height,
                         width=in_raster.width,
@@ -476,42 +389,20 @@ class FFTConvolution:
                         tilerows=tilerows,
                         tilecols=tilecols
                     )
-                    #windows for the new raster are made in two steps: generator and array
-                    new_windows = self.__compute_windows(
-                        in_raster=in_raster,
-                        height=height,
-                        width=width,
-                        size=size,
-                        tilerows=tilerows,
-                        tilecols=tilecols,
-                        generator=False
-                    )
                     #if windows are too big or invalid, we process the raster without them
                     try:
-                        iter(old_windows)
-                        iter(new_windows)
+                        iter(new_processing_windows)
+                        processing_windows = new_processing_windows
                     except TypeError:
-                        tiled = False
+                        pass
+
+                # copy original raster parameters
+                kwargs = in_raster.profile
+
                 with rasterio.open(out_path,'w',**kwargs) as out_raster:
-                    out_raster = self.__reproject(in_raster, out_raster, affine, new_crs)
-                    if tiled:
-                        for index, window in old_windows:
-                            oldbigwindow = self.__extend_window(window,size,in_raster.height,in_raster.width)
-                            in_array = in_raster.read(window=oldbigwindow)
-                            out_array = self.__gaussian_blur(in_array, size)
-                            #for edge detection we subtract the output array from the original
-                            #this may produce some artifacts when the raster is reprojected
-                            #or extensive and with degree coordinates
-                            if edge:
-                                out_array = np.subtract(in_array, out_array)
-                            #now compute the window for writing into the new raster
-                            nwindow = new_windows[index[0]][index[1]]
-                            newbigwindow = self.__extend_window(nwindow,size,height,width)
-                            out_raster.write(out_array,window=newbigwindow)
-                    else:
-                        in_array = in_raster.read()
+                    for index, window in processing_windows:
+                        extended_window = self.__extend_window(window,size,in_raster.height,in_raster.width)
+                        in_array = in_raster.read(window=extended_window)
                         out_array = self.__gaussian_blur(in_array, size)
-                        if edge:
-                            out_array = out_array = np.subtract(in_array, out_array)
-                        out_raster.write(out_array)
+                        out_raster.write(out_array, window=extended_window)
         return self.__load_layer(out_path)
